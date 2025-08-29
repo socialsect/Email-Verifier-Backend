@@ -244,44 +244,7 @@ def update_job_progress(job_id, progress, row, total, log, status='running'):
             })
 
 
-# ---------- NEW ENDPOINT FOR SINGLE EMAIL VERIFICATION ----------
-@app.route('/verify-single', methods=['GET', 'OPTIONS'])
-def verify_single():
-    if request.method == 'OPTIONS':
-        return '', 200
-    
-    email = request.args.get('email')
-    if not email:
-        return jsonify({'error': 'Email parameter is required'}), 400
-    
-    try:
-        result = verifier.verify_email(email)
-        
-        # Format response for n8n compatibility
-        response_data = {
-            'email': result['email'],
-            'status': result['status'],
-            'deliverability': 'DELIVERABLE' if result['status'] == 'valid' else 'UNDELIVERABLE',
-            'is_valid': result['is_valid'],
-            'confidence': result['confidence'],
-            'details': result['details']
-        }
-        
-        return jsonify(response_data)
-    
-    except Exception as e:
-        logger.error(f"Error verifying single email {email}: {e}")
-        return jsonify({
-            'email': email,
-            'status': 'error',
-            'deliverability': 'UNKNOWN',
-            'is_valid': False,
-            'confidence': 0,
-            'details': [f'Error: {str(e)}']
-        }), 500
-
-
-# ---------- EXISTING ENDPOINTS (unchanged) ----------
+# ---------- Routes (same as before) ----------
 
 @app.route('/verify', methods=['POST', 'OPTIONS'])
 def verify():
