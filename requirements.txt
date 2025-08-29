@@ -1,3 +1,5 @@
 Flask
 dnspython
 gunicorn
+python-whois
+requests
