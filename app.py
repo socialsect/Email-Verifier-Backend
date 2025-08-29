@@ -12,6 +12,8 @@ import threading
 from datetime import datetime
 from functools import lru_cache
 from flask import Flask, request, jsonify, send_file
+from flask_cors import CORS
+
 
 # ------------------- Logging -------------------
 logging.basicConfig(level=logging.INFO)
@@ -191,6 +193,7 @@ class EnhancedEmailVerifier:
 
 # ------------------- Flask Integration -------------------
 app = Flask(__name__)
+CORS(app)
 verifier = EnhancedEmailVerifier()
 jobs = {}
 
