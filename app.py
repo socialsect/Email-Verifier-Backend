@@ -4,486 +4,270 @@ import re
 import smtplib
 import socket
 import time
-import ssl
-import dns.exception
 import uuid
 import io
-import threading
 import logging
-from flask import Flask, request, jsonify, Response
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime, timedelta
-from functools import wraps
+import whois
+import threading
+from datetime import datetime
+from functools import lru_cache
+from flask import Flask, request, jsonify, send_file
 
-# Configure logging
+# ------------------- Logging -------------------
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Create Flask app
-app = Flask(__name__)
-
-# Configuration
-VERIFICATION_TIMEOUT = 10  # seconds
-MAX_WORKERS = 3  # Reduced for better resource management
-JOB_RETENTION_HOURS = 24  # How long to keep job data
-MAX_FILE_SIZE = 5 * 1024 * 1024  # 5MB max file size
-MAX_EMAILS_PER_JOB = 10000  # Reasonable limit for processing
-
-# In-memory storage for job data with timestamps
-data = {}
-data_lock = threading.Lock()
-
-
-def cleanup_old_jobs():
-    """Remove jobs older than JOB_RETENTION_HOURS"""
-    cutoff = datetime.now() - timedelta(hours=JOB_RETENTION_HOURS)
-    with data_lock:
-        expired_jobs = [job_id for job_id, job_data in data.items()
-                        if job_data.get('created_at', datetime.now()) < cutoff]
-        for job_id in expired_jobs:
-            del data[job_id]
-            logger.info(f"Cleaned up expired job: {job_id}")
-
-
-def require_job_id(f):
-    """Decorator to validate job_id parameter"""
-    @wraps(f)
-    def decorated_function(*args, **kwargs):
-        job_id = request.args.get('job_id')
-        if not job_id or job_id not in data:
-            return jsonify({'error': 'Invalid or missing job ID'}), 404
-        return f(job_id, *args, **kwargs)
-    return decorated_function
-
-
-# Add CORS headers for all routes
-@app.after_request
-def after_request(response):
-    response.headers.add('Access-Control-Allow-Origin', '*')
-    response.headers.add('Access-Control-Allow-Headers', 'Content-Type,Authorization')
-    response.headers.add('Access-Control-Allow-Methods', 'GET,PUT,POST,DELETE,OPTIONS')
-    return response
-
-
-# Email validation patterns
-EMAIL_REGEX = re.compile(r'^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$')
-
-# Expanded disposable domains list
-DISPOSABLE_DOMAINS = {
-    'mailinator.com', 'guerrillamail.com', '10minutemail.com', 'tempmail.com',
-    'yopmail.com', 'maildrop.cc', 'temp-mail.org', 'throwaway.email',
-    'getnada.com', 'mohmal.com', 'sharklasers.com', 'grr.la', 'guerrillamailblock.com',
-    '10minutesemail.net', 'tempr.email', 'tempail.com', 'emailondeck.com'
-}
-
-ROLE_BASED_PREFIXES = {
-    "info", "support", "admin", "sales", "contact", "help", "service",
-    "billing", "accounts", "marketing", "hr", "jobs", "careers", "press",
-    "media", "legal", "compliance", "security", "webmaster", "postmaster"
-}
-
-
-class EmailVerifier:
+# ------------------- Verifier Class -------------------
+class EnhancedEmailVerifier:
     def __init__(self):
         self.results = {}
         self.dns_resolver = dns.resolver.Resolver()
         self.dns_resolver.nameservers = ['8.8.8.8', '1.1.1.1', '9.9.9.9']
-        self.dns_resolver.timeout = VERIFICATION_TIMEOUT
-        self.dns_resolver.lifetime = VERIFICATION_TIMEOUT
+        self.dns_resolver.timeout = 10
+        self.dns_resolver.lifetime = 10
 
+        # Cache for performance
+        self.mx_cache = {}
+        self.domain_rep_cache = {}
+        self.catch_all_cache = {}
+
+        # Default thresholds
+        self.domain_age_suspicious = 14     # days
+        self.domain_age_new = 90            # days
+        self.disposable_domains = {"mailinator.com", "guerrillamail.com", "tempmail.com"}
+        self.smtp_timeout = 10
+        self.smtp_delay = 1
+        self.max_smtp_retries = 3
+
+        # Role-based prefixes
+        self.role_prefixes = {
+            "info", "support", "admin", "sales", "contact", "help", "service",
+            "billing", "accounts", "marketing", "hr", "jobs", "careers", "press",
+            "media", "legal", "compliance", "security", "webmaster", "postmaster",
+            "noreply", "no-reply", "donotreply", "abuse", "feedback", "newsletter",
+            "notifications", "alerts", "automated", "system", "daemon", "mailer"
+        }
+
+        # Your domain for SMTP HELO
+        self.helo_domain = "gosocialsect.com"
+
+        # Common domain typos
+        self.common_domains = {
+            'gmail.com': ['gmai.com', 'gmial.com', 'gmail.co', 'gmaill.com', 'gmil.com', 'gmal.com'],
+            'yahoo.com': ['yaho.com', 'yahooo.com', 'yahoo.co', 'yhoo.com', 'ymail.com'],
+            'outlook.com': ['outloo.com', 'outlook.co', 'outlok.com'],
+            'hotmail.com': ['hotmial.com', 'hotmai.com', 'hotmall.com'],
+            'aol.com': ['aol.co', 'aoil.com', 'aoll.com'],
+            'icloud.com': ['iclou.com', 'icloud.co', 'iclod.com'],
+            'protonmail.com': ['protonmai.com', 'protonmail.co', 'proton.com']
+        }
+
+    # ------------------- Email Checks -------------------
     def check_syntax(self, email):
-        """Check if email has valid syntax with additional validation"""
         if not email or len(email) > 254:
             return False, "Email too long or empty"
-
-        if not EMAIL_REGEX.match(email):
+        email_pattern = r'^[a-zA-Z0-9!#$%&\'*+/=?^_`{|}~-]+(?:\.[a-zA-Z0-9!#$%&\'*+/=?^_`{|}~-]+)*@[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?(?:\.[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)*$'
+        if not re.match(email_pattern, email):
             return False, "Invalid email format"
-
-        if '..' in email:
-            return False, "Consecutive dots not allowed"
-
-        local_part = email.split('@')[0]
-        if len(local_part) > 64:
+        if '..' in email or email.startswith('.') or email.endswith('.'):
+            return False, "Invalid dot placement"
+        local, domain = email.split('@')
+        if len(local) > 64:
             return False, "Local part too long"
+        if len(domain) > 253:
+            return False, "Domain part too long"
+        return True, "Valid syntax"
 
-        return True, ""
-
-    def check_disposable(self, domain):
+    def suggest_domain_correction(self, domain):
+        from difflib import get_close_matches
         domain_lower = domain.lower()
-        if domain_lower in DISPOSABLE_DOMAINS:
-            return False, "Disposable email domain"
+        for correct, typos in self.common_domains.items():
+            if domain_lower in typos:
+                return correct
+        matches = get_close_matches(domain_lower, self.common_domains.keys(), n=1, cutoff=0.8)
+        return matches[0] if matches else None
 
-        disposable_patterns = ['temp', 'disposable', 'throwaway', '10min', 'fake']
-        if any(pattern in domain_lower for pattern in disposable_patterns):
-            return False, "Suspected disposable email domain"
-
-        return True, ""
-
-    def check_mx_records(self, domain):
+    @lru_cache(maxsize=1000)
+    def check_mx_records_cached(self, domain):
         try:
             mx_records = self.dns_resolver.resolve(domain, 'MX')
             if mx_records:
                 sorted_mx = sorted(mx_records, key=lambda x: x.preference)
-                return True, str(sorted_mx[0].exchange).rstrip('.')
-        except (dns.resolver.NXDOMAIN, dns.resolver.NoAnswer):
+                return True, str(sorted_mx[0].exchange).rstrip('.'), [str(mx.exchange).rstrip('.') for mx in sorted_mx[:3]]
+        except Exception:
             pass
-        except Exception as e:
-            logger.warning(f"MX lookup error for {domain}: {e}")
-
         try:
             a_records = self.dns_resolver.resolve(domain, 'A')
             if a_records:
-                return True, domain
-        except Exception as e:
-            logger.warning(f"A record lookup error for {domain}: {e}")
+                return True, domain, [domain]
+        except Exception:
+            pass
+        return False, "No valid DNS records found", []
 
-        return False, "No valid DNS records found"
-
-    def check_smtp(self, email, mx_record):
-        domain = email.split('@')[-1].lower()
-        if domain in DISPOSABLE_DOMAINS:
-            return False, "Disposable email domain"
+    def check_domain_reputation(self, domain):
+        if domain in self.domain_rep_cache:
+            return self.domain_rep_cache[domain]
+        result = {"age_days": None, "is_suspicious": False, "reason": ""}
         try:
+            w = whois.whois(domain)
+            created = w.creation_date
+            if created:
+                if isinstance(created, list):
+                    created = created[0]
+                age_days = (datetime.now() - created).days
+                result["age_days"] = age_days
+                if age_days < self.domain_age_suspicious:
+                    result["is_suspicious"] = True
+                    result["reason"] = f"Domain too new ({age_days} days)"
+                elif age_days < self.domain_age_new:
+                    result["reason"] = f"Domain relatively new ({age_days} days)"
+        except Exception:
+            result["reason"] = "Could not determine domain age"
+        self.domain_rep_cache[domain] = result
+        return result
+
+    def check_smtp_connection(self, email, mx_record, timeout=None):
+        if timeout is None:
+            timeout = self.smtp_timeout
+        try:
+            time.sleep(self.smtp_delay)
+            server = smtplib.SMTP(timeout=timeout)
+            server.connect(mx_record, 25)
             try:
-                mx_records = self.dns_resolver.resolve(domain, 'MX')
-                if not mx_records:
-                    try:
-                        self.dns_resolver.resolve(domain, 'A')
-                    except:
-                        return False, "No valid DNS records found"
+                server.ehlo(self.helo_domain)
             except:
-                return False, "DNS resolution failed"
-
-            return True, "Email domain is valid"
-
+                server.helo(self.helo_domain)
+            server.mail(f"test@{self.helo_domain}")
+            code, message = server.rcpt(email)
+            server.quit()
+            if code == 250: return True, "Mailbox exists"
+            if code == 251: return True, "Forwarded"
+            if code in [550, 551, 553]: return False, "Mailbox doesn't exist"
+            return None, "Uncertain"
         except Exception as e:
-            logger.warning(f"SMTP verification error for {email}: {str(e)}")
-            return False, f"Verification error: {str(e)}"
+            return None, f"SMTP error: {e}"
 
-    def verify_email(self, email, job_id=None):
-        result = {
-            'email': email,
-            'is_valid': False,
-            'status': 'invalid',
-            'details': [],
-            'confidence': 0
-        }
-
+    def verify_email_enhanced(self, email):
+        result = {'email': email, 'is_valid': False, 'status': 'invalid',
+                  'details': [], 'confidence': 0, 'suggestions': []}
         try:
-            if job_id and data.get(job_id, {}).get('cancelled'):
-                result['details'].append("Verification cancelled")
-                return result
-
             valid, msg = self.check_syntax(email)
             if not valid:
                 result['details'].append(f"Syntax: {msg}")
-                result['confidence'] = 0
                 return result
-
-            result['confidence'] = 20
             local, domain = email.split('@')
-            domain = domain.lower()
-            local = local.lower()
-
-            if local in ROLE_BASED_PREFIXES:
+            domain = domain.lower(); local = local.lower()
+            suggestion = self.suggest_domain_correction(domain)
+            if suggestion:
+                result['suggestions'].append(f"{local}@{suggestion}")
+                return result
+            if local in self.role_prefixes:
                 result['status'] = 'risky'
-                result['details'].append("Role-based email address")
-                result['confidence'] = 30
+                result['details'].append("Role-based address")
+            if domain in self.disposable_domains:
+                result['details'].append("Disposable domain")
                 return result
-
-            result['confidence'] = 40
-            valid, msg = self.check_disposable(domain)
-            if not valid:
-                result['details'].append(f"Disposable: {msg}")
-                result['confidence'] = 10
-                return result
-
-            result['confidence'] = 60
-            valid, mx_info = self.check_mx_records(domain)
+            domain_rep = self.check_domain_reputation(domain)
+            if domain_rep["is_suspicious"]:
+                result['status'] = 'risky'
+                result['details'].append(domain_rep["reason"])
+            valid, mx_info, _ = self.check_mx_records_cached(domain)
             if not valid:
                 result['details'].append(f"DNS: {mx_info}")
-                result['confidence'] = 20
                 return result
-
-            result['confidence'] = 80
-            result['details'].append(f"Mail server: {mx_info}")
-
-            valid, smtp_msg = self.check_smtp(email, mx_info)
-            if valid:
+            smtp_valid, smtp_msg = self.check_smtp_connection(email, mx_info)
+            if smtp_valid:
                 result['is_valid'] = True
                 result['status'] = 'valid'
-                result['confidence'] = 95
-                result['details'].append(f"SMTP: {smtp_msg}")
+                result['details'].append(smtp_msg)
+            elif smtp_valid is False:
+                result['details'].append(smtp_msg)
             else:
-                result['details'].append(f"SMTP: {smtp_msg}")
                 result['status'] = 'risky'
-                result['confidence'] = 60
-
-            return result
-
+                result['details'].append(smtp_msg)
         except Exception as e:
-            result['details'].append(f"Error: {str(e)}")
-            result['status'] = 'error'
-            result['confidence'] = 0
-            return result
+            result['details'].append(f"Error: {e}")
+        return result
 
+# ------------------- Flask Integration -------------------
+app = Flask(__name__)
+verifier = EnhancedEmailVerifier()
+jobs = {}
 
-verifier = EmailVerifier()
+def update_job_progress(job_id, valid, risky, invalid, message, status):
+    jobs[job_id].update({
+        "valid": valid, "risky": risky, "invalid": invalid,
+        "message": message, "status": status
+    })
 
+def process_file(file, job_id, email_field="email"):
+    try:
+        content = file.read().decode('utf-8-sig')
+        reader = list(csv.DictReader(io.StringIO(content)))
+        results = []
+        valid_count = risky_count = invalid_count = 0
+        for i, row in enumerate(reader, 1):
+            email = (row.get(email_field) or '').strip()
+            if not email:
+                result = {"status": "invalid", "details": "Empty email"}
+                invalid_count += 1
+            else:
+                result = verifier.verify_email_enhanced(email)
+                if result["status"] == "valid": valid_count += 1
+                elif result["status"] == "risky": risky_count += 1
+                else: invalid_count += 1
+            results.append({**row, **result})
+            if i % 10 == 0 or i == len(reader):
+                update_job_progress(job_id, valid_count, risky_count, invalid_count,
+                                    f"{i}/{len(reader)} processed", "in-progress")
+        jobs[job_id]["results"] = results
+        update_job_progress(job_id, valid_count, risky_count, invalid_count,
+                            "Completed", "done")
+    except Exception as e:
+        update_job_progress(job_id, 0, 0, 0, str(e), "error")
 
-def update_job_progress(job_id, progress, row, total, log, status='running'):
-    with data_lock:
-        if job_id in data:
-            data[job_id].update({
-                'progress': min(100, max(0, progress)),
-                'row': row,
-                'total': total,
-                'log': log,
-                'status': status,
-                'updated_at': datetime.now()
-            })
-
-
-# ---------- Routes (same as before) ----------
-
-@app.route('/verify', methods=['POST', 'OPTIONS'])
-def verify():
-    if request.method == 'OPTIONS':
-        return '', 200
-
+# ------------------- Endpoints -------------------
+@app.route("/upload", methods=["POST"])
+def upload_file():
     if 'file' not in request.files:
-        return jsonify({'error': 'No file provided'}), 400
-
+        return jsonify({"error": "No file"}), 400
     file = request.files['file']
-
-    if not file.filename:
-        return jsonify({'error': 'No file selected'}), 400
-
-    if not file.filename.lower().endswith('.csv'):
-        return jsonify({'error': 'Only CSV files are supported'}), 400
-
-    file.seek(0, 2)
-    file_size = file.tell()
-    file.seek(0)
-
-    if file_size > MAX_FILE_SIZE:
-        return jsonify({'error': f'File too large. Maximum size: {MAX_FILE_SIZE // (1024*1024)}MB'}), 400
-
     job_id = str(uuid.uuid4())
+    jobs[job_id] = {"status": "starting", "results": []}
+    threading.Thread(target=process_file, args=(file, job_id)).start()
+    return jsonify({"job_id": job_id})
 
-    with data_lock:
-        data[job_id] = {
-            'progress': 0,
-            'row': 0,
-            'total': 0,
-            'log': 'Initializing...',
-            'results': [],
-            'status': 'starting',
-            'created_at': datetime.now(),
-            'updated_at': datetime.now(),
-            'cancelled': False
-        }
+@app.route("/status/<job_id>", methods=["GET"])
+def check_status(job_id):
+    return jsonify(jobs.get(job_id, {"error": "Invalid job ID"}))
 
-    def process_file():
-        try:
-            content = file.read().decode('utf-8-sig')
-            reader = list(csv.DictReader(io.StringIO(content)))
+@app.route("/results/<job_id>", methods=["GET"])
+def get_results(job_id):
+    job = jobs.get(job_id)
+    if not job: return jsonify({"error": "Invalid job ID"}), 404
+    return jsonify(job.get("results", []))
 
-            if not reader:
-                update_job_progress(job_id, 0, 0, 0, 'Error: Empty CSV file', 'error')
-                return
-
-            total_emails = len(reader)
-
-            if total_emails > MAX_EMAILS_PER_JOB:
-                update_job_progress(job_id, 0, 0, 0,
-                                    f'Error: Too many emails. Maximum: {MAX_EMAILS_PER_JOB}', 'error')
-                return
-
-            headers = [h.lower().strip() for h in reader[0].keys()]
-            email_field = None
-            for original_header, lower_header in zip(reader[0].keys(), headers):
-                if lower_header in ['email', 'email_address', 'e-mail', 'mail']:
-                    email_field = original_header
-                    break
-
-            if not email_field:
-                update_job_progress(job_id, 0, 0, 0,
-                                    'Error: No email column found. Expected: email, email_address, e-mail, or mail',
-                                    'error')
-                return
-
-            update_job_progress(job_id, 0, 0, total_emails, f'Processing {total_emails} emails...', 'running')
-
-            valid_count = risky_count = invalid_count = 0
-
-            for i, row in enumerate(reader, 1):
-                if data.get(job_id, {}).get('cancelled'):
-                    update_job_progress(job_id, 100, i, total_emails, 'Verification cancelled', 'cancelled')
-                    break
-
-                email = (row.get(email_field) or '').strip()
-
-                if not email:
-                    result_row = {**row, 'status': 'invalid', 'details': 'Empty email', 'confidence': 0}
-                    invalid_count += 1
-                else:
-                    result = verifier.verify_email(email, job_id)
-                    status = result.get('status', 'invalid').lower()
-                    if status == 'error':
-                        status = 'invalid'
-                    result_row = {
-                        **row,
-                        'status': status,
-                        'details': ' | '.join(result.get('details', ['Unknown error'])),
-                        'confidence': result.get('confidence', 0)
-                    }
-                    if status == 'valid':
-                        valid_count += 1
-                    elif status == 'risky':
-                        risky_count += 1
-                    else:
-                        invalid_count += 1
-
-                with data_lock:
-                    if job_id in data:
-                        data[job_id]['results'].append(result_row)
-
-                progress = int((i / total_emails) * 100)
-                update_job_progress(job_id, progress, i, total_emails,
-                                    f"Processing... Valid: {valid_count}, Risky: {risky_count}, Invalid: {invalid_count}",
-                                    'running')
-
-                time.sleep(0.1)
-
-            if not data.get(job_id, {}).get('cancelled'):
-                final_log = f"Complete! Valid: {valid_count}, Risky: {risky_count}, Invalid: {invalid_count}"
-                update_job_progress(job_id, 100, total_emails, total_emails, final_log, 'completed')
-
-        except Exception as e:
-            logger.error(f"Processing error for job {job_id}: {e}")
-            update_job_progress(job_id, 0, 0, 0, f'Error: {str(e)}', 'error')
-
-    thread = threading.Thread(target=process_file)
-    thread.daemon = True
-    thread.start()
-
-    if len(data) > 100:
-        cleanup_thread = threading.Thread(target=cleanup_old_jobs)
-        cleanup_thread.daemon = True
-        cleanup_thread.start()
-
-    return jsonify({'job_id': job_id, 'message': 'Verification started'})
-
-
-@app.route('/progress')
-@require_job_id
-def progress(job_id):
-    job = data[job_id]
-    return jsonify({
-        'percent': job.get('progress', 0),
-        'row': job.get('row', 0),
-        'total': job.get('total', 0),
-        'status': job.get('status', 'unknown')
-    })
-
-
-@app.route('/log')
-@require_job_id
-def log(job_id):
-    return data[job_id].get('log', 'No log available')
-
-
-@app.route('/cancel', methods=['POST', 'OPTIONS'])
-def cancel():
-    if request.method == 'OPTIONS':
-        return '', 200
-
-    job_id = request.args.get('job_id')
-    if job_id and job_id in data:
-        with data_lock:
-            data[job_id]['cancelled'] = True
-            data[job_id]['status'] = 'cancelled'
-        return jsonify({'message': 'Job cancelled'})
-    return jsonify({'error': 'Job not found'}), 404
-
-
-@app.route('/download')
-@require_job_id
-def download(job_id):
-    filter_type = request.args.get('type', 'all')
-    if 'results' not in data[job_id]:
-        return 'No results found for this job', 404
-
-    results = data[job_id]['results']
-    if filter_type == 'valid':
-        filtered = [r for r in results if r.get('status') == 'valid']
-    elif filter_type == 'risky':
-        filtered = [r for r in results if r.get('status') == 'risky']
-    elif filter_type == 'invalid':
-        filtered = [r for r in results if r.get('status') == 'invalid']
-    elif filter_type == 'risky_invalid':
-        filtered = [r for r in results if r.get('status') in ('risky', 'invalid')]
-    else:
-        filtered = results
-
-    if not filtered:
-        return 'No data available for the selected filter', 404
-
+@app.route("/download/<job_id>", methods=["GET"])
+def download_results(job_id):
+    job = jobs.get(job_id)
+    if not job or "results" not in job:
+        return jsonify({"error": "Invalid job ID or no results"}), 404
     output = io.StringIO()
-    fieldnames = list(filtered[0].keys())
-    writer = csv.DictWriter(output, fieldnames=fieldnames)
+    writer = csv.DictWriter(output, fieldnames=job["results"][0].keys())
     writer.writeheader()
-    for row in filtered:
-        writer.writerow(row)
+    writer.writerows(job["results"])
     output.seek(0)
+    return send_file(io.BytesIO(output.getvalue().encode("utf-8")),
+                     mimetype="text/csv", as_attachment=True,
+                     download_name=f"results_{job_id}.csv")
 
-    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-    filename = f"email_verification_{filter_type}_{timestamp}.csv"
+@app.route("/cancel/<job_id>", methods=["POST"])
+def cancel_job(job_id):
+    if job_id in jobs:
+        jobs[job_id]["cancelled"] = True
+        return jsonify({"message": f"Job {job_id} cancelled"})
+    return jsonify({"error": "Invalid job ID"}), 404
 
-    return Response(
-        output.getvalue(),
-        mimetype='text/csv',
-        headers={"Content-Disposition": f"attachment; filename={filename}"}
-    )
-
-
-@app.route('/stats')
-@require_job_id
-def stats(job_id):
-    job = data[job_id]
-    if 'results' not in job:
-        return jsonify({'error': 'No results available'}), 404
-    results = job['results']
-    total = len(results)
-    if total == 0:
-        return jsonify({'total': 0})
-
-    valid = sum(1 for r in results if r.get('status') == 'valid')
-    risky = sum(1 for r in results if r.get('status') == 'risky')
-    invalid = sum(1 for r in results if r.get('status') == 'invalid')
-
-    return jsonify({
-        'total': total,
-        'valid': valid,
-        'risky': risky,
-        'invalid': invalid,
-        'valid_percentage': round((valid / total) * 100, 1),
-        'risky_percentage': round((risky / total) * 100, 1),
-        'invalid_percentage': round((invalid / total) * 100, 1)
-    })
-
-
-@app.errorhandler(413)
-def too_large(e):
-    return jsonify({'error': 'File too large'}), 413
-
-
-@app.errorhandler(500)
-def internal_error(e):
-    return jsonify({'error': 'Internal server error'}), 500
-
-
-if __name__ == '__main__':
-    # For local testing only - Render will use Gunicorn
-    app.run(debug=True, host='0.0.0.0', port=5000, threaded=True)
+# ------------------- Run -------------------
+if __name__ == "__main__":
+    app.run(debug=True, port=5000)
