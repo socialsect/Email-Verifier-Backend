@@ -268,6 +268,15 @@ def cancel_job(job_id):
         return jsonify({"message": f"Job {job_id} cancelled"})
     return jsonify({"error": "Invalid job ID"}), 404
 
+@app.route("/verify-single", methods=["GET"])
+def verify_single():
+    email = request.args.get("email")
+    if not email:
+        return jsonify({"error": "Email required"}), 400
+    result = verifier.verify_email_enhanced(email)
+    result["deliverability"] = "YES" if result.get("is_valid") else "NO"
+    return jsonify(result)
+
 # ------------------- Run -------------------
 if __name__ == "__main__":
     app.run(debug=True, port=5000)
