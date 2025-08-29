@@ -3,3 +3,4 @@ dnspython
 gunicorn
 python-whois
 requests
+flask_cors
