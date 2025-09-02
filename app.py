@@ -15,27 +15,45 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
 from functools import wraps
 
-# Configure logging
+# ---------------------------------------------------------
+# Logging
+# ---------------------------------------------------------
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Create Flask app
+# ---------------------------------------------------------
+# Flask
+# ---------------------------------------------------------
 app = Flask(__name__)
 
-# Configuration
-VERIFICATION_TIMEOUT = 10  # seconds
-MAX_WORKERS = 3  # Reduced for better resource management
-JOB_RETENTION_HOURS = 24  # How long to keep job data
-MAX_FILE_SIZE = 5 * 1024 * 1024  # 5MB max file size
-MAX_EMAILS_PER_JOB = 10000  # Reasonable limit for processing
+# ---------------------------------------------------------
+# Config
+# ---------------------------------------------------------
+VERIFICATION_TIMEOUT = 10         # DNS + socket timeout (seconds)
+SMTP_CONNECT_TIMEOUT = 12         # SMTP connect timeout
+SMTP_CMD_TIMEOUT = 12             # (socket timeout covers SMTP commands)
+MAX_WORKERS = 3                   # keep it modest; SMTP servers rate-limit
+JOB_RETENTION_HOURS = 24
+MAX_FILE_SIZE = 5 * 1024 * 1024
+MAX_EMAILS_PER_JOB = 10000
 
-# In-memory storage for job data with timestamps
+# Our legit sender identity (you already configured DNS for this)
+SENDER_DOMAIN = "verify.pikkipals.com"
+SENDER_EMAIL = f"probe@{SENDER_DOMAIN}"
+
+# Try at most this many MX hosts per domain (top N by priority)
+MAX_MX_TO_TRY = 3
+
+# Gentle per-domain throttle (seconds between probes)
+PER_DOMAIN_MIN_GAP = 0.6
+
+# ---------------------------------------------------------
+# In-memory job store
+# ---------------------------------------------------------
 data = {}
 data_lock = threading.Lock()
 
-
 def cleanup_old_jobs():
-    """Remove jobs older than JOB_RETENTION_HOURS"""
     cutoff = datetime.now() - timedelta(hours=JOB_RETENTION_HOURS)
     with data_lock:
         expired_jobs = [job_id for job_id, job_data in data.items()
@@ -44,9 +62,7 @@ def cleanup_old_jobs():
             del data[job_id]
             logger.info(f"Cleaned up expired job: {job_id}")
 
-
 def require_job_id(f):
-    """Decorator to validate job_id parameter"""
     @wraps(f)
     def decorated_function(*args, **kwargs):
         job_id = request.args.get('job_id')
@@ -55,8 +71,9 @@ def require_job_id(f):
         return f(job_id, *args, **kwargs)
     return decorated_function
 
-
-# Add CORS headers for all routes
+# ---------------------------------------------------------
+# CORS
+# ---------------------------------------------------------
 @app.after_request
 def after_request(response):
     response.headers.add('Access-Control-Allow-Origin', '*')
@@ -64,11 +81,11 @@ def after_request(response):
     response.headers.add('Access-Control-Allow-Methods', 'GET,PUT,POST,DELETE,OPTIONS')
     return response
 
-
-# Email validation patterns
+# ---------------------------------------------------------
+# Validators / constants
+# ---------------------------------------------------------
 EMAIL_REGEX = re.compile(r'^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$')
 
-# Expanded disposable domains list
 DISPOSABLE_DOMAINS = {
     'mailinator.com', 'guerrillamail.com', '10minutemail.com', 'tempmail.com',
     'yopmail.com', 'maildrop.cc', 'temp-mail.org', 'throwaway.email',
@@ -82,7 +99,20 @@ ROLE_BASED_PREFIXES = {
     "media", "legal", "compliance", "security", "webmaster", "postmaster"
 }
 
+# Providers that commonly hide RCPT status / act accept-all
+HIDDEN_STATUS_MX_SUFFIXES = (
+    "aspmx.l.google.com", "googlemail.com",
+    "protection.outlook.com",
+    "yahoodns.net",
+    "icloud-mail.com",
+    "mx.zoho.com", "mx.zohomail.com",
+    "mx.yandex.net",
+    "mail.protonmail.ch", "protonmail.ch"
+)
 
+# ---------------------------------------------------------
+# Verifier
+# ---------------------------------------------------------
 class EmailVerifier:
     def __init__(self):
         self.results = {}
@@ -90,76 +120,147 @@ class EmailVerifier:
         self.dns_resolver.nameservers = ['8.8.8.8', '1.1.1.1', '9.9.9.9']
         self.dns_resolver.timeout = VERIFICATION_TIMEOUT
         self.dns_resolver.lifetime = VERIFICATION_TIMEOUT
+        self._last_probe = {}  # domain -> last timestamp
 
+    # ---------- Basic checks ----------
     def check_syntax(self, email):
-        """Check if email has valid syntax with additional validation"""
         if not email or len(email) > 254:
             return False, "Email too long or empty"
-
         if not EMAIL_REGEX.match(email):
             return False, "Invalid email format"
-
         if '..' in email:
             return False, "Consecutive dots not allowed"
-
-        local_part = email.split('@')[0]
+        local_part = email.split('@', 1)[0]
         if len(local_part) > 64:
             return False, "Local part too long"
-
         return True, ""
 
     def check_disposable(self, domain):
         domain_lower = domain.lower()
         if domain_lower in DISPOSABLE_DOMAINS:
             return False, "Disposable email domain"
-
         disposable_patterns = ['temp', 'disposable', 'throwaway', '10min', 'fake']
         if any(pattern in domain_lower for pattern in disposable_patterns):
             return False, "Suspected disposable email domain"
-
         return True, ""
 
     def check_mx_records(self, domain):
+        """Return (True, [mx hosts...]) or (True, [domain]) if A fallback; else (False, reason)."""
         try:
             mx_records = self.dns_resolver.resolve(domain, 'MX')
-            if mx_records:
-                sorted_mx = sorted(mx_records, key=lambda x: x.preference)
-                return True, str(sorted_mx[0].exchange).rstrip('.')
+            mx_sorted = sorted(mx_records, key=lambda x: x.preference)
+            hosts = [str(r.exchange).rstrip('.') for r in mx_sorted]
+            if hosts:
+                return True, hosts
         except (dns.resolver.NXDOMAIN, dns.resolver.NoAnswer):
             pass
         except Exception as e:
             logger.warning(f"MX lookup error for {domain}: {e}")
 
+        # RFC fallback to A record
         try:
             a_records = self.dns_resolver.resolve(domain, 'A')
             if a_records:
-                return True, domain
+                return True, [domain]
         except Exception as e:
             logger.warning(f"A record lookup error for {domain}: {e}")
 
         return False, "No valid DNS records found"
 
-    def check_smtp(self, email, mx_record):
-        domain = email.split('@')[-1].lower()
-        if domain in DISPOSABLE_DOMAINS:
-            return False, "Disposable email domain"
+    # ---------- SMTP probing ----------
+    def _throttle_domain(self, domain):
+        now = time.time()
+        last = self._last_probe.get(domain, 0.0)
+        gap = now - last
+        if gap < PER_DOMAIN_MIN_GAP:
+            time.sleep(PER_DOMAIN_MIN_GAP - gap)
+        self._last_probe[domain] = time.time()
+
+    def check_smtp_one_host(self, email, mx_host):
+        """
+        Real SMTP RCPT probe against a single host.
+        Returns (verdict, message):
+          verdict True  => mailbox accepted (and domain not catch-all)
+          verdict False => explicit rejection (5xx)
+          verdict None  => unknown (4xx/timeout/policy/accept-all)
+        """
+        target = email.strip()
+        domain = target.split("@", 1)[-1].lower()
+
+        # Certain providers never reveal validity; treat as unknown
+        for suf in HIDDEN_STATUS_MX_SUFFIXES:
+            if mx_host.endswith(suf):
+                return None, f"{mx_host}: provider hides status"
+
+        local_helo = f"probe-{uuid.uuid4().hex[:8]}.{SENDER_DOMAIN}"
+        ctx = ssl.create_default_context()
+
         try:
-            try:
-                mx_records = self.dns_resolver.resolve(domain, 'MX')
-                if not mx_records:
+            with smtplib.SMTP(host=mx_host, port=25, timeout=SMTP_CONNECT_TIMEOUT, local_hostname=local_helo) as smtp:
+                smtp.set_debuglevel(0)
+
+                # some providers don't like super-short timeouts
+                socket.setdefaulttimeout(SMTP_CMD_TIMEOUT)
+
+                code, resp = smtp.ehlo_or_helo_if_needed()
+                if code >= 400:
+                    return None, f"{mx_host}: EHLO/HELO rejected {code}"
+
+                if smtp.has_extn("starttls"):
                     try:
-                        self.dns_resolver.resolve(domain, 'A')
-                    except:
-                        return False, "No valid DNS records found"
-            except:
-                return False, "DNS resolution failed"
+                        smtp.starttls(context=ctx)
+                        smtp.ehlo()
+                    except smtplib.SMTPException:
+                        # continue without TLS if STARTTLS fails
+                        pass
 
-            return True, "Email domain is valid"
+                code, resp = smtp.mail(SENDER_EMAIL)
+                if code >= 400:
+                    return None, f"{mx_host}: MAIL FROM rejected {code}"
 
+                # First RCPT
+                code, resp = smtp.rcpt(target)
+                msg = f"{mx_host}: RCPT {code}"
+
+                if 200 <= code < 300:
+                    # Possible catch-all: test two random RCPTs
+                    import random, string
+                    fake1 = ''.join(random.choices(string.ascii_lowercase, k=12)) + "@" + domain
+                    fake2 = ''.join(random.choices(string.ascii_lowercase, k=12)) + "@" + domain
+                    c1, _ = smtp.rcpt(fake1)
+                    c2, _ = smtp.rcpt(fake2)
+                    if (200 <= c1 < 300) and (200 <= c2 < 300):
+                        return None, f"{msg} | domain appears catch-all"
+                    return True, msg
+
+                if 400 <= code < 500:
+                    return None, msg  # greylist/temporary
+
+                if code >= 500:
+                    return False, msg  # explicit rejection
+
+                return None, msg
+
+        except (smtplib.SMTPServerDisconnected, smtplib.SMTPConnectError) as e:
+            return None, f"{mx_host}: connect error {str(e)}"
+        except (socket.timeout, TimeoutError):
+            return None, f"{mx_host}: timeout"
         except Exception as e:
-            logger.warning(f"SMTP verification error for {email}: {str(e)}")
-            return False, f"Verification error: {str(e)}"
+            return None, f"{mx_host}: exception {str(e)}"
 
+    def smtp_probe_any_mx(self, email, domain, mx_hosts):
+        """Try up to N MX hosts by priority; stop on definitive verdict."""
+        tried = 0
+        last_msg = ""
+        for mx in mx_hosts[:MAX_MX_TO_TRY]:
+            self._throttle_domain(domain)
+            verdict, msg = self.check_smtp_one_host(email, mx)
+            last_msg = msg
+            if verdict is True or verdict is False:
+                return verdict, msg
+        return None, last_msg or "All MXs returned unknown"
+
+    # ---------- Public API ----------
     def verify_email(self, email, job_id=None):
         result = {
             'email': email,
@@ -174,62 +275,71 @@ class EmailVerifier:
                 result['details'].append("Verification cancelled")
                 return result
 
-            valid, msg = self.check_syntax(email)
-            if not valid:
+            ok, msg = self.check_syntax(email)
+            if not ok:
                 result['details'].append(f"Syntax: {msg}")
-                result['confidence'] = 0
                 return result
 
             result['confidence'] = 20
-            local, domain = email.split('@')
+            local, domain = email.split('@', 1)
             domain = domain.lower()
             local = local.lower()
 
             if local in ROLE_BASED_PREFIXES:
                 result['status'] = 'risky'
-                result['details'].append("Role-based email address")
                 result['confidence'] = 30
+                result['details'].append("Role-based email address")
                 return result
 
-            result['confidence'] = 40
-            valid, msg = self.check_disposable(domain)
-            if not valid:
+            ok, msg = self.check_disposable(domain)
+            if not ok:
                 result['details'].append(f"Disposable: {msg}")
                 result['confidence'] = 10
                 return result
 
-            result['confidence'] = 60
-            valid, mx_info = self.check_mx_records(domain)
-            if not valid:
+            result['confidence'] = 50
+            ok, mx_info = self.check_mx_records(domain)
+            if not ok:
                 result['details'].append(f"DNS: {mx_info}")
                 result['confidence'] = 20
                 return result
 
-            result['confidence'] = 80
-            result['details'].append(f"Mail server: {mx_info}")
+            result['confidence'] = 70
+            result['details'].append(f"Mail servers: {', '.join(mx_info[:3])}{' ...' if len(mx_info) > 3 else ''}")
 
-            valid, smtp_msg = self.check_smtp(email, mx_info)
-            if valid:
+            # Real SMTP probe across MXes
+            verdict, smtp_msg = self.smtp_probe_any_mx(email, domain, mx_info)
+
+            if verdict is True:
                 result['is_valid'] = True
                 result['status'] = 'valid'
-                result['confidence'] = 95
+                result['confidence'] = 97
+                result['details'].append(f"SMTP: {smtp_msg}")
+            elif verdict is False:
+                result['is_valid'] = False
+                result['status'] = 'invalid'
+                result['confidence'] = 90
                 result['details'].append(f"SMTP: {smtp_msg}")
             else:
-                result['details'].append(f"SMTP: {smtp_msg}")
+                # unknown / catch-all / greylist / policy / hidden providers
+                result['is_valid'] = False
                 result['status'] = 'risky'
                 result['confidence'] = 60
+                result['details'].append(f"SMTP: {smtp_msg}")
 
             return result
 
         except Exception as e:
+            logger.exception("verify_email error")
             result['details'].append(f"Error: {str(e)}")
             result['status'] = 'error'
             result['confidence'] = 0
             return result
 
-
+# ---------------------------------------------------------
+# Instance
+# ---------------------------------------------------------
 verifier = EmailVerifier()
-
 
 def update_job_progress(job_id, progress, row, total, log, status='running'):
     with data_lock:
@@ -243,9 +353,9 @@ def update_job_progress(job_id, progress, row, total, log, status='running'):
                 'updated_at': datetime.now()
             })
 
-
-# ---------- Routes (same as before) ----------
-
+# ---------------------------------------------------------
+# Routes
+# ---------------------------------------------------------
 @app.route('/verify', methods=['POST', 'OPTIONS'])
 def verify():
     if request.method == 'OPTIONS':
@@ -375,7 +485,6 @@ def verify():
 
     return jsonify({'job_id': job_id, 'message': 'Verification started'})
 
-
 @app.route('/progress')
 @require_job_id
 def progress(job_id):
@@ -387,18 +496,15 @@ def progress(job_id):
         'status': job.get('status', 'unknown')
     })
 
-
 @app.route('/log')
 @require_job_id
 def log(job_id):
     return data[job_id].get('log', 'No log available')
 
-
 @app.route('/cancel', methods=['POST', 'OPTIONS'])
 def cancel():
     if request.method == 'OPTIONS':
         return '', 200
-
     job_id = request.args.get('job_id')
     if job_id and job_id in data:
         with data_lock:
@@ -406,7 +512,6 @@ def cancel():
             data[job_id]['status'] = 'cancelled'
         return jsonify({'message': 'Job cancelled'})
     return jsonify({'error': 'Job not found'}), 404
-
 
 @app.route('/download')
 @require_job_id
@@ -447,7 +552,6 @@ def download(job_id):
         headers={"Content-Disposition": f"attachment; filename={filename}"}
     )
 
-
 @app.route('/stats')
 @require_job_id
 def stats(job_id):
@@ -473,16 +577,13 @@ def stats(job_id):
         'invalid_percentage': round((invalid / total) * 100, 1)
     })
 
-
 @app.errorhandler(413)
 def too_large(e):
     return jsonify({'error': 'File too large'}), 413
 
-
 @app.errorhandler(500)
 def internal_error(e):
     return jsonify({'error': 'Internal server error'}), 500
-
 
 if __name__ == '__main__':
     # For local testing only - Render will use Gunicorn
